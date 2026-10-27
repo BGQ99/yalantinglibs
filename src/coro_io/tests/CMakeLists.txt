@@ -38,6 +38,23 @@ endif()
 add_subdirectory(ibverbs)
 add_subdirectory(networkdirect)
 
+if(YLT_ENABLE_URMA AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # Use real SDK declarations and test-only C API implementations; no device
+    # or liburma is needed by this executable.
+    add_executable(urma_buffer_ownership_test
+            urma/test_urma_buffer_ownership.cpp
+            urma/mock_urma.cpp
+            main.cpp)
+    get_property(urma_test_libraries DIRECTORY PROPERTY LINK_LIBRARIES)
+    list(REMOVE_ITEM urma_test_libraries -lurma)
+    set_property(TARGET urma_buffer_ownership_test PROPERTY
+                 LINK_LIBRARIES ${urma_test_libraries})
+    target_link_options(urma_buffer_ownership_test PRIVATE "-Wl,--wrap=_Znwm")
+    add_test(NAME urma_buffer_ownership_test COMMAND urma_buffer_ownership_test)
+    set_tests_properties(urma_buffer_ownership_test PROPERTIES TIMEOUT 60)
+endif()
+
 if(YLT_HAS_OWN_RING)
     add_executable(own_ring_test test_own_ring.cpp)
     target_compile_definitions(own_ring_test PRIVATE OWN_RING_FAULT_INJECT)

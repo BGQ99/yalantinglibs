@@ -935,6 +935,7 @@ class urma_socket_t {
       return {};
     auto owner = std::make_shared<detail::urma_recv_buffer_owner>(
         buffer_pool(), std::move(state_->recv_buffer_));
+    state_->recv_buffer_ = {};
     owned_data_view view{data_view{remain_data_, -1}, std::move(owner)};
     remain_data_ = {};
     return view;
@@ -947,6 +948,7 @@ class urma_socket_t {
     auto data = data_view{state_->recv_buffer_.addr, size, -1};
     auto owner = std::make_shared<detail::urma_recv_buffer_owner>(
         buffer_pool(), std::move(state_->recv_buffer_));
+    state_->recv_buffer_ = {};
     return owned_data_view{data, std::move(owner)};
   }
 
@@ -1214,9 +1216,8 @@ class urma_socket_t {
   }
 
   void release_recv_buffer() {
-    auto buffer = std::move(state_->recv_buffer_);
-    if (buffer)
-      state_->buffer_pool_->return_buffer(buffer);
+    if (state_->recv_buffer_)
+      state_->buffer_pool_->return_buffer(state_->recv_buffer_);
   }
 
   void close_handshake_socket() {
