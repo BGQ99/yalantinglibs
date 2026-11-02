@@ -64,42 +64,42 @@ class scoped_env_var {
 
 TEST_CASE("urma rpc env enable parsing") {
   {
-    scoped_env_var env("URMA_RPC_ENABLE", "1");
+    scoped_env_var env("MC_YLT_URMA_ENABLE", "1");
     CHECK(coro_io::detail::urma_rpc_env_enabled());
   }
   {
-    scoped_env_var env("URMA_RPC_ENABLE", "ON");
+    scoped_env_var env("MC_YLT_URMA_ENABLE", "ON");
     CHECK(coro_io::detail::urma_rpc_env_enabled());
   }
   {
-    scoped_env_var env("URMA_RPC_ENABLE", "true");
+    scoped_env_var env("MC_YLT_URMA_ENABLE", "true");
     CHECK(coro_io::detail::urma_rpc_env_enabled());
   }
   {
-    scoped_env_var env("URMA_RPC_ENABLE", "yes");
+    scoped_env_var env("MC_YLT_URMA_ENABLE", "yes");
     CHECK(coro_io::detail::urma_rpc_env_enabled());
   }
   {
-    scoped_env_var env("URMA_RPC_ENABLE", "0");
+    scoped_env_var env("MC_YLT_URMA_ENABLE", "0");
     CHECK_FALSE(coro_io::detail::urma_rpc_env_enabled());
   }
   {
-    scoped_env_var env("URMA_RPC_ENABLE", "abc");
+    scoped_env_var env("MC_YLT_URMA_ENABLE", "abc");
     CHECK_FALSE(coro_io::detail::urma_rpc_env_enabled());
   }
 }
 
 TEST_CASE("urma rpc env config parsing uses defaults for invalid values") {
-  scoped_env_var enable("URMA_RPC_ENABLE", "1");
-  scoped_env_var device("URMA_RPC_DEVICE", "test_dev");
-  scoped_env_var eid("URMA_RPC_EID_INDEX", "7");
-  scoped_env_var cq("URMA_RPC_CQ_SIZE", "abc");
-  scoped_env_var recv("URMA_RPC_RECV_BUFFER_CNT", "9");
-  scoped_env_var send("URMA_RPC_SEND_BUFFER_CNT", "10");
-  scoped_env_var buffer("URMA_RPC_BUFFER_SIZE", "8192");
-  scoped_env_var memory("URMA_RPC_MAX_MEMORY_USAGE", "16777216");
-  scoped_env_var tp("URMA_RPC_TP_TYPE", "rtp");
-  scoped_env_var priority("URMA_RPC_PRIORITY", "7");
+  scoped_env_var enable("MC_YLT_URMA_ENABLE", "1");
+  scoped_env_var device("MC_YLT_URMA_DEVICE", "test_dev");
+  scoped_env_var eid("MC_YLT_URMA_EID_INDEX", "7");
+  scoped_env_var cq("MC_YLT_URMA_CQ_SIZE", "abc");
+  scoped_env_var recv("MC_YLT_URMA_RECV_BUFFER_CNT", "9");
+  scoped_env_var send("MC_YLT_URMA_SEND_BUFFER_CNT", "10");
+  scoped_env_var buffer("MC_YLT_URMA_BUFFER_SIZE", "8192");
+  scoped_env_var memory("MC_YLT_URMA_MAX_MEMORY_USAGE", "16777216");
+  scoped_env_var tp("MC_YLT_URMA_TP_TYPE", "rtp");
+  scoped_env_var priority("MC_YLT_URMA_PRIORITY", "7");
 
   auto config = coro_io::detail::make_urma_rpc_config_from_env();
   CHECK(config.device_name == "test_dev");
@@ -169,34 +169,34 @@ TEST_CASE("urma client init recovers after failure") {
 
 TEST_CASE("urma rpc env event mode defaults to on and can be overridden") {
   {
-    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var enable("MC_YLT_URMA_ENABLE", "1");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
     CHECK(config.event_mode == true);
     CHECK(config.busy_poll_budget ==
           coro_io::urma_socket_t::config_t{}.busy_poll_budget);
   }
   {
-    scoped_env_var enable("URMA_RPC_ENABLE", "1");
-    scoped_env_var mode("URMA_RPC_EVENT_MODE", "0");
+    scoped_env_var enable("MC_YLT_URMA_ENABLE", "1");
+    scoped_env_var mode("MC_YLT_URMA_EVENT_MODE", "0");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
     CHECK(config.event_mode == false);
   }
   {
-    scoped_env_var enable("URMA_RPC_ENABLE", "1");
-    scoped_env_var mode("URMA_RPC_EVENT_MODE", "off");
+    scoped_env_var enable("MC_YLT_URMA_ENABLE", "1");
+    scoped_env_var mode("MC_YLT_URMA_EVENT_MODE", "off");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
     CHECK(config.event_mode == false);
   }
   {
-    scoped_env_var enable("URMA_RPC_ENABLE", "1");
-    scoped_env_var budget("URMA_RPC_BUSY_POLL_BUDGET", "32");
+    scoped_env_var enable("MC_YLT_URMA_ENABLE", "1");
+    scoped_env_var budget("MC_YLT_URMA_BUSY_POLL_BUDGET", "32");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
     CHECK(config.busy_poll_budget == 32);
   }
 }
 
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {
-  scoped_env_var enable("URMA_RPC_ENABLE", "0");
+  scoped_env_var enable("MC_YLT_URMA_ENABLE", "0");
 
   coro_rpc::coro_rpc_client client;
   CHECK(std::holds_alternative<coro_rpc::coro_rpc_client::tcp_config>(
@@ -204,8 +204,8 @@ TEST_CASE("urma rpc env disabled keeps default client tcp config") {
 }
 
 TEST_CASE("urma rpc enabled without usable device keeps client constructible") {
-  scoped_env_var enable("URMA_RPC_ENABLE", "1");
-  scoped_env_var device("URMA_RPC_DEVICE",
+  scoped_env_var enable("MC_YLT_URMA_ENABLE", "1");
+  scoped_env_var device("MC_YLT_URMA_DEVICE",
                         "device_that_should_not_exist_for_test");
 
   coro_rpc::coro_rpc_client client;
