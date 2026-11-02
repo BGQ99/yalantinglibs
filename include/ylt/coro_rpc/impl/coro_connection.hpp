@@ -43,6 +43,7 @@
 #include "ylt/coro_io/socket_wrapper.hpp"
 #include "ylt/coro_rpc/impl/errno.h"
 #include "ylt/util/utils.hpp"
+#include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #ifdef UNIT_TEST_INJECT
 #include "inject_action.hpp"
 #endif
@@ -56,6 +57,7 @@ struct context_info_t {
 #ifndef CORO_RPC_TEST
  private:
 #endif
+  std::shared_ptr<rpc_profile::request_trace> profile_;
   typename rpc_protocol::route_key_t key_;
   typename rpc_protocol::router &router_;
   std::shared_ptr<coro_connection> conn_;
@@ -70,6 +72,9 @@ struct context_info_t {
   std::atomic<context_status> status_ = context_status::init;
 
  public:
+  const std::shared_ptr<rpc_profile::request_trace>& profile() const {
+    return profile_;
+  }
   template <typename, typename>
   friend class context_base;
   friend class coro_connection;
@@ -244,6 +249,8 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       typename rpc_protocol::req_header req_head_tmp{};
       std::error_code ec;
       auto tp = std::chrono::steady_clock::now();
+      rpc_profile::stage_sample header_sample(
+          rpc_profile::stage::server_read_header, nullptr, 0, rpc_profile::slow_threshold_ns() != 0);
       // timer will be reset after rpc call response
       if (req_id == 0) {
         ec = co_await rpc_protocol::read_first_head(socket, req_head_tmp,
@@ -252,6 +259,7 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       else {
         ec = co_await rpc_protocol::read_head(socket, req_head_tmp);
       }
+      auto header_ns = header_sample.finish();
       // `co_await async_read` uses asio::async_read underlying.
       // If eof occurred, the bytes_transferred of `co_await async_read` must
       // less than RPC_HEAD_LEN. Incomplete data will be discarded.
@@ -306,6 +314,15 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       auto &req_attachment = context_info->req_attachment_;
       auto &key = context_info->key_;
       req_head = std::move(req_head_tmp);
+      key = rpc_protocol::get_route_key(req_head);
+      context_info->profile_.reset();
+      if (rpc_profile::enabled() || rpc_profile::slow_threshold_ns()) {
+        context_info->profile_ = rpc_profile::make_trace(
+            conn_id_, static_cast<uint32_t>(context_info->get_request_id()),
+            router.get_name(key), true);
+      }
+      if (context_info->profile_)
+        context_info->profile_->add(rpc_profile::stage::server_read_header, header_ns);
       auto serialize_proto = rpc_protocol::get_serialize_protocol(req_head);
 
       if (!serialize_proto.has_value())
@@ -321,13 +338,18 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       std::string_view payload;
       // rpc_protocol::buffer_type maybe from user, default from framework.
 
+      rpc_profile::stage_sample payload_sample(
+          rpc_profile::stage::server_read_payload, context_info->profile_.get());
       ec = co_await rpc_protocol::read_payload(
           socket, req_head, body, req_attachment, context_info.get());
+      payload_sample.finish();
       cancel_timer(req_id, "recv client data");
       payload = std::string_view{body};
 
       if (ec)
         AS_UNLIKELY {
+          if (context_info->profile_)
+            context_info->profile_->finish_read_error();
           ELOG_ERROR << "read error: " << ec.message() << ", conn_id "
                      << conn_id_ << ", request ID:" << req_id
                      << ", cost time = "
@@ -379,7 +401,7 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
                             start_execute_time_point, req_id, ret.first,
                             ret.second, context_info->req_head_,
                             std::move(context_info->resp_attachment_),
-                            std::move(context_info->complete_handler_));
+                            std::move(context_info->complete_handler_), context_info->profile_);
                   });
                 },
                 socket_wrapper_.get_executor());
@@ -425,7 +447,7 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
         direct_response_msg<rpc_protocol>(
             start_execute_time_point, req_id, resp_err, resp_buf, req_head,
             std::move(context_info->resp_attachment_),
-            std::move(context_info->complete_handler_));
+            std::move(context_info->complete_handler_), context_info->profile_);
         context_info->resp_attachment_ = [] {
           return coro_io::data_view{std::string_view{}, -1};
         };
@@ -447,7 +469,10 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       const typename rpc_protocol::req_header &req_head,
       std::function<coro_io::data_view()> &&attachment,
       std::function<void(const std::error_code &, std::size_t)>
-          &&complete_handler) {
+          &&complete_handler,
+      std::shared_ptr<rpc_profile::request_trace> profile = {}) {
+    rpc_profile::stage_sample construct_sample(
+        rpc_profile::stage::server_serialize_response, profile.get());
     std::string resp_error_msg;
     if (resp_err) {
       resp_error_msg = std::move(resp_buf);
@@ -458,8 +483,9 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
     std::string header_buf = rpc_protocol::prepare_response(
         resp_buf, req_head, attachment().length(), resp_err, resp_error_msg);
 
+    construct_sample.finish();
     response(start_tp, req_id, std::move(header_buf), std::move(resp_buf),
-             std::move(attachment), std::move(complete_handler), nullptr)
+             std::move(attachment), std::move(complete_handler), nullptr, std::move(profile))
         .start([](auto &&) {
         });
   }
@@ -470,19 +496,23 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
                     std::function<coro_io::data_view()> &&resp_attachment,
                     const typename rpc_protocol::req_header &req_head,
                     std::function<void(const std::error_code &, std::size_t)>
-                        &&complete_handler) {
+                        &&complete_handler,
+      std::shared_ptr<rpc_profile::request_trace> profile = {}) {
+    rpc_profile::stage_sample construct_sample(
+        rpc_profile::stage::server_serialize_response, profile.get());
     std::string header_buf = rpc_protocol::prepare_response(
         body_buf, req_head, resp_attachment().size());
+    construct_sample.finish();
     asio::dispatch(
         socket_wrapper_.get_executor()->get_asio_executor(),
         [watcher = weak_from_this(), header_buf = std::move(header_buf),
          body_buf = std::move(body_buf),
          resp_attachment = std::move(resp_attachment),
-         handler = std::move(complete_handler), req_id, start_tp]() mutable {
+         handler = std::move(complete_handler), req_id, start_tp, profile = std::move(profile)]() mutable {
           if (auto self = watcher.lock()) {
             self->response(start_tp, req_id, std::move(header_buf),
                            std::move(body_buf), std::move(resp_attachment),
-                           std::move(handler), self)
+                           std::move(handler), self, std::move(profile))
                 .start([](auto &&) {
                 });
           }
@@ -495,15 +525,19 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
                       std::string_view error_msg,
                       const typename rpc_protocol::req_header &req_head,
                       std::function<void(const std::error_code &, std::size_t)>
-                          &&complete_handler) {
+                          &&complete_handler,
+      std::shared_ptr<rpc_profile::request_trace> profile = {}) {
+    rpc_profile::stage_sample construct_sample(
+        rpc_profile::stage::server_serialize_response, profile.get());
     std::string body_buf;
     std::string header_buf =
         rpc_protocol::prepare_response(body_buf, req_head, 0, ec, error_msg);
+    construct_sample.finish();
     asio::dispatch(
         socket_wrapper_.get_executor()->get_asio_executor(),
         [watcher = weak_from_this(), header_buf = std::move(header_buf),
          body_buf = std::move(body_buf), handler = std::move(complete_handler),
-         req_id, start_tp]() mutable {
+         req_id, start_tp, profile = std::move(profile)]() mutable {
           if (auto self = watcher.lock()) {
             self->response(
                     start_tp, req_id, std::move(header_buf),
@@ -511,7 +545,7 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
                     []() -> coro_io::data_view {
                       return {};
                     },
-                    std::move(handler), self)
+                    std::move(handler), self, std::move(profile))
                 .start([](auto &&) {
                 });
           }
@@ -603,6 +637,13 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
     std::pair<std::error_code, size_t> ret;
     while (!write_queue_.empty()) {
       auto &msg = write_queue_.front();
+      auto profile = std::get<4>(msg);
+      if (auto queued = std::get<5>(msg)) {
+        auto duration = rpc_profile::now_ns() - queued;
+        rpc_profile::record(rpc_profile::stage::server_response_queue, duration);
+        if (profile)
+          profile->add(rpc_profile::stage::server_response_queue, duration);
+      }
 #ifdef UNIT_TEST_INJECT
       if (g_action == inject_action::force_inject_connection_close_socket) {
         ELOG_WARN
@@ -612,6 +653,8 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
         co_return;
       }
 #endif
+      rpc_profile::stage_sample send_sample(
+          rpc_profile::stage::server_send_response, profile.get());
       coro_io::data_view attachment = std::get<2>(msg)();
       if (attachment.empty()) {
         std::array<asio::const_buffer, 2> buffers{
@@ -633,6 +676,8 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
           ret = co_await coro_io::async_write(socket, buffers);
         }
       }
+      send_sample.finish();
+      if (profile) profile->finish(ret.first ? "send_error" : "ok");
       auto &complete_handler = std::get<3>(msg);
       if (complete_handler) {
         complete_handler(ret.first, ret.second);
@@ -663,7 +708,7 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       std::string header_buf, std::string body_buf,
       std::function<coro_io::data_view()> resp_attachment,
       std::function<void(const std::error_code, std::size_t)> complete_handler,
-      rpc_conn self) noexcept {
+      rpc_conn self, std::shared_ptr<rpc_profile::request_trace> profile = {}) noexcept {
     if (has_closed())
       AS_UNLIKELY {
         ELOG_DEBUG << "response_msg failed: connection has been closed"
@@ -679,10 +724,12 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
 #endif
     write_queue_.emplace_back(std::move(header_buf), std::move(body_buf),
                               std::move(resp_attachment),
-                              std::move(complete_handler));
+                              std::move(complete_handler), profile, 0);
+    if (profile || rpc_profile::enabled())
+      std::get<5>(write_queue_.back()) = rpc_profile::now_ns();
     --rpc_processing_cnt_;
     assert(rpc_processing_cnt_ >= 0);
-    ELOG_INFO << "finish rpc function execution, conn_id = " << conn_id_
+    ELOG_DEBUG << "finish rpc function execution, conn_id = " << conn_id_
               << ", request ID:" << req_id << ", cost time = "
               << (std::chrono::steady_clock::now() - start_tp) /
                      std::chrono::microseconds(1)
@@ -747,7 +794,8 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
   // FIXME: queue's performance can be imporved.
   std::deque<
       std::tuple<std::string, std::string, std::function<coro_io::data_view()>,
-                 std::function<void(const std::error_code, std::size_t)>>>
+                 std::function<void(const std::error_code, std::size_t)>,
+                 std::shared_ptr<rpc_profile::request_trace>, uint64_t>>
       write_queue_;
   bool is_rpc_return_by_callback_{false};
 

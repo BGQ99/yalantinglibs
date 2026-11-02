@@ -232,6 +232,97 @@ TEST_CASE("RPC trace is opt-in and reports message sizes and round trip") {
   }
 }
 
+// A held client-local statistics lock must delay the RPC continuation without
+// moving the already observed response endpoint used by the original RTT log.
+TEST_CASE("RPC trace excludes response profiling lock wait from RTT") {
+  namespace profile = coro_io::urma_benchmark_profile;
+  struct restore_profiling {
+    bool enabled = profile::enabled();
+    uint32_t rate = profile::sample_rate_value().load();
+    ~restore_profiling() { profile::configure(enabled, rate); }
+  } restore;
+  profile::configure(true, 1);
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  struct stop_pool {
+    std::shared_ptr<coro_io::io_context_pool> pool = coro_io::create_io_context_pool(1);
+    ~stop_pool() { pool->stop(); }
+  } client_pool;
+  coro_rpc_client client(client_pool.pool->get_executor());
+  auto* samples = syncAwait(coro_io::post([] {
+    return &profile::local_samples();
+  }, &client.get_executor())).value();
+  const auto header_stage = static_cast<std::size_t>(profile::stage::client_recv_header);
+  uint32_t headers_before;
+  {
+    std::lock_guard lock(samples->snapshot_mutex);
+    headers_before = samples->counters[header_stage];
+  }
+  auto executor = coro_io::get_global_executor()->get_asio_executor();
+  tcp::acceptor acceptor(executor, {asio::ip::address_v4::loopback(), 0});
+  tcp::socket socket(executor);
+  REQUIRE_FALSE(syncAwait(client.connect(
+      "127.0.0.1", std::to_string(acceptor.local_endpoint().port()))));
+  auto gate = std::make_shared<rpc_trace_response_gate>();
+  rpc_trace_release_guard release_on_exit{gate};
+  std::promise<void> header_sent, server_done;
+  auto header_ready = header_sent.get_future();
+  auto server_finished = server_done.get_future();
+  auto serve = [&]() -> Lazy<void> {
+    auto ec = co_await coro_io::async_accept(acceptor, socket);
+    if (ec) co_return;
+    std::array<char, coro_rpc_protocol::REQ_HEAD_LEN> header;
+    auto read = co_await coro_io::async_read(socket, asio::buffer(header));
+    if (read.first) co_return;
+    coro_rpc_protocol::req_header request;
+    auto error = struct_pack::deserialize_to<struct_pack::sp_config::DISABLE_ALL_META_INFO>(
+        request, std::string_view(header.data(), header.size()));
+    if (error) co_return;
+    std::string body(request.length, '\0');
+    read = co_await coro_io::async_read(socket, asio::buffer(body));
+    if (read.first) co_return;
+    auto response = struct_pack::serialize<std::string>(std::string("reply"));
+    auto response_header = coro_rpc_protocol::prepare_response(response, request, 0);
+    auto written = co_await coro_io::async_write(socket, asio::buffer(response_header));
+    if (written.first) co_return;
+    header_sent.set_value();
+    co_await gate->promise.getFuture();
+    co_await coro_io::async_write(socket, asio::buffer(response));
+  };
+  serve().start([&](auto&&) { server_done.set_value(); });
+  using result_type = rpc_result<std::string>;
+  std::promise<result_type> response;
+  auto result = response.get_future();
+  auto begin = std::chrono::steady_clock::now();
+  client.call_for<rpc_trace_echo>(5s, std::string("request")).start(
+      [&](auto&& value) { response.set_value(std::move(value).value()); });
+  CHECK(header_ready.wait_for(2s) == std::future_status::ready);
+  std::unique_lock lock(samples->snapshot_mutex, std::defer_lock);
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (true) {
+    lock.lock();
+    if (samples->counters[header_stage] > headers_before ||
+        std::chrono::steady_clock::now() >= deadline) break;
+    lock.unlock();
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(samples->counters[header_stage] == headers_before + 1);
+  gate->release();
+  std::this_thread::sleep_for(500ms);
+  lock.unlock();
+  auto received = result.get();
+  auto total_us = std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - begin).count();
+  server_finished.wait();
+  REQUIRE(received.has_value());
+  CHECK(received.value() == "reply");
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 1);
+  CHECK(total_us - rpc_trace_number(lines[0], "rtt_us") >= 200000);
+}
+
 TEST_CASE("RPC trace counts request and response attachments") {
   g_action = {};
   rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");

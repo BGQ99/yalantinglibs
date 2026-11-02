@@ -25,7 +25,12 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <memory>
+#include <sstream>
+#include <limits>
 #include <numeric>
+#include <random>
+#include <thread>
 #include <string_view>
 #include <vector>
 
@@ -82,6 +87,17 @@ enum class stage : uint8_t {
   urma_read_copy,
   urma_read_view,
   raw_client_write,
+  client_write_mutex_wait,
+  client_wait_send_slot,
+  client_response_resume,
+  urma_timer_wakeup_delay,
+  urma_post_queue_delay,
+  urma_poll_call,
+  urma_poll_round,
+  urma_completion_callback,
+  urma_completion_detect_to_callback,
+  urma_poll_completions,
+  urma_completion_resume,
   count
 };
 
@@ -114,6 +130,18 @@ inline constexpr std::array<std::string_view,
         "urma.read_copy",
         "urma.read_view",
         "raw.client_write",
+        "client.write_mutex_wait",
+        "client.wait_send_slot",
+        "client.response_resume",
+        "urma.timer_wakeup_delay",
+        "urma.post_queue_delay",
+        "urma.poll_call",
+        "urma.poll_round",
+        "urma.completion_callback",
+        "urma.completion_detect_to_callback",
+        "urma.poll_completions",
+        "urma.completion_resume",
+
 };
 
 inline std::atomic<bool>& enabled_flag() {
@@ -127,6 +155,18 @@ inline std::atomic<uint32_t>& sample_rate_value() {
 }
 
 inline void print(std::ostream& os);
+
+inline void register_exit_print() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    std::atexit([] {
+      if (enabled_flag().load(std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[rpc_profile] atexit: printing profile\n");
+        print(std::cerr);
+      }
+    });
+  });
+}
 
 inline void init_from_env() {
   static std::once_flag flag;
@@ -145,10 +185,7 @@ inline void init_from_env() {
         sample_rate_value().store(r, std::memory_order_relaxed);
     }
     if (enabled_flag().load(std::memory_order_relaxed)) {
-      std::atexit([]() {
-        std::fprintf(stderr, "[rpc_profile] atexit: printing profile\n");
-        print(std::cerr);
-      });
+      register_exit_print();
     }
   });
 }
@@ -161,6 +198,9 @@ inline bool enabled() noexcept {
 }
 
 inline void configure(bool enabled, uint32_t sample_rate) noexcept {
+  init_from_env();
+  if (enabled)
+    register_exit_print();
   enabled_flag().store(enabled, std::memory_order_relaxed);
   sample_rate_value().store(std::max<uint32_t>(sample_rate, 1),
                             std::memory_order_relaxed);
@@ -173,38 +213,90 @@ inline uint64_t now_ns() noexcept {
           .count());
 }
 
+// Only the newly added, high-frequency polling stages use bounded reservoirs.
+inline constexpr std::size_t polling_sample_limit = 4096;
+inline bool is_polling_stage(std::size_t id) {
+  return id >= static_cast<std::size_t>(stage::urma_timer_wakeup_delay) &&
+         id < static_cast<std::size_t>(stage::count);
+}
+
+// Merge two uniform reservoirs by drawing population counts without replacement,
+// then drawing that many retained values from each. Busy and idle threads must
+// contribute in proportion to their eligible event counts, not reservoir sizes.
+inline void merge_polling_samples(std::vector<uint64_t>& dst, uint64_t& dst_seen,
+                                  const std::vector<uint64_t>& src,
+                                  uint64_t src_seen, std::mt19937_64& rng) {
+  if (!src_seen)
+    return;
+  if (!dst_seen) {
+    dst = src;
+    dst_seen = src_seen;
+    return;
+  }
+  auto left = dst;
+  auto right = src;
+  uint64_t left_count = dst_seen, right_count = src_seen;
+  std::size_t left_used = 0, right_used = 0;
+  const auto size = std::min<uint64_t>(polling_sample_limit, dst_seen + src_seen);
+  dst.clear();
+  dst.reserve(size);
+  for (std::size_t i = 0; i < size; ++i) {
+    const bool take_left =
+        std::uniform_int_distribution<uint64_t>(
+            0, left_count + right_count - 1)(rng) < left_count;
+    auto& values = take_left ? left : right;
+    auto& used = take_left ? left_used : right_used;
+    auto index = std::uniform_int_distribution<std::size_t>(
+        used, values.size() - 1)(rng);
+    std::swap(values[used], values[index]);
+    dst.push_back(values[used++]);
+    --(take_left ? left_count : right_count);
+  }
+  dst_seen += src_seen;
+}
+
 // Per-thread, per-stage, per-bucket samples.
 struct thread_samples {
   std::array<std::array<std::vector<uint64_t>, bucket_count>,
              static_cast<std::size_t>(stage::count)>
       samples;
   std::array<uint32_t, static_cast<std::size_t>(stage::count)> counters{};
+  std::array<uint64_t, static_cast<std::size_t>(stage::count)> polling_seen{};
+  std::mt19937_64 polling_rng{now_ns()};
+  // Only the owner thread and the snapshot reader take this lock.
+  std::mutex snapshot_mutex;
   ~thread_samples();
 };
 
 inline std::mutex& registry_mutex() {
-  static std::mutex value;
-  return value;
+  static auto* value = new std::mutex;
+  return *value;
 }
 
 inline std::array<std::array<std::vector<uint64_t>, bucket_count>,
                   static_cast<std::size_t>(stage::count)>&
 merged_samples() {
-  static std::array<std::array<std::vector<uint64_t>, bucket_count>,
-                    static_cast<std::size_t>(stage::count)>
-      value;
-  return value;
+  // Deliberately process-lived: atexit and TLS destruction order can differ.
+  static auto* value =
+      new std::array<std::array<std::vector<uint64_t>, bucket_count>,
+                     static_cast<std::size_t>(stage::count)>;
+  return *value;
 }
 
 inline std::array<uint32_t, static_cast<std::size_t>(stage::count)>&
 merged_counters() {
-  static std::array<uint32_t, static_cast<std::size_t>(stage::count)> value{};
-  return value;
+  static auto* value = new std::array<uint32_t, static_cast<std::size_t>(stage::count)>{};
+  return *value;
+}
+
+inline auto& merged_polling_seen() {
+  static auto* value = new std::array<uint64_t, static_cast<std::size_t>(stage::count)>{};
+  return *value;
 }
 
 inline std::vector<thread_samples*>& registry() {
-  static std::vector<thread_samples*> value;
-  return value;
+  static auto* value = new std::vector<thread_samples*>;
+  return *value;
 }
 
 inline thread_samples& local_samples() {
@@ -224,6 +316,11 @@ inline thread_samples::~thread_samples() {
   auto& dst_cnt = merged_counters();
   for (std::size_t s = 0; s < samples.size(); ++s) {
     dst_cnt[s] += counters[s];
+    if (is_polling_stage(s)) {
+      merge_polling_samples(dst[s][0], merged_polling_seen()[s], samples[s][0],
+                            polling_seen[s], polling_rng);
+      continue;
+    }
     for (std::size_t b = 0; b < bucket_count; ++b) {
       dst[s][b].insert(dst[s][b].end(), samples[s][b].begin(),
                        samples[s][b].end());
@@ -239,13 +336,28 @@ inline void record_with_size(stage stage_id, uint64_t duration_ns,
   if (!enabled())
     return;
   auto& local = local_samples();
+  std::lock_guard snapshot_lock(local.snapshot_mutex);
   auto s = static_cast<std::size_t>(stage_id);
-  auto b = size_to_bucket(payload_size);
+  auto b = is_polling_stage(s) ? 0 : size_to_bucket(payload_size);
   auto rate = sample_rate_value().load(std::memory_order_relaxed);
   auto counter = ++local.counters[s];
   if ((counter % rate) != 0)
     return;
-  local.samples[s][b].push_back(duration_ns);
+  auto& values = local.samples[s][b];
+  if (is_polling_stage(s)) {
+    auto seen = ++local.polling_seen[s];
+    if (values.size() < polling_sample_limit) {
+      values.push_back(duration_ns);
+    }
+    else {
+      auto index = std::uniform_int_distribution<uint64_t>(0, seen - 1)(
+          local.polling_rng);
+      if (index < polling_sample_limit)
+        values[index] = duration_ns;
+    }
+    return;
+  }
+  values.push_back(duration_ns);
 }
 
 inline void record(stage stage_id, uint64_t duration_ns) {
@@ -273,8 +385,15 @@ inline void reserve_per_stage(std::size_t count) {
   if (!enabled())
     return;
   auto& local = local_samples();
-  for (auto& stage_buckets : local.samples)
-    for (auto& bucket : stage_buckets) bucket.reserve(count);
+  std::lock_guard snapshot_lock(local.snapshot_mutex);
+  for (std::size_t s = 0; s < local.samples.size(); ++s) {
+    if (is_polling_stage(s)) {
+      local.samples[s][0].reserve(std::min(count, polling_sample_limit));
+    }
+    else {
+      for (auto& bucket : local.samples[s]) bucket.reserve(count);
+    }
+  }
 }
 
 inline void print(std::ostream& os) {
@@ -283,10 +402,13 @@ inline void print(std::ostream& os) {
              static_cast<std::size_t>(stage::count)>
       merged;
   std::array<uint32_t, static_cast<std::size_t>(stage::count)> total_counters{};
+  std::array<uint64_t, static_cast<std::size_t>(stage::count)> polling_seen{};
+  std::mt19937_64 polling_rng{now_ns()};
   {
     std::lock_guard<std::mutex> lock(registry_mutex());
     for (std::size_t s = 0; s < merged.size(); ++s) {
       total_counters[s] += merged_counters()[s];
+      polling_seen[s] = merged_polling_seen()[s];
       for (std::size_t b = 0; b < bucket_count; ++b) {
         auto& src = merged_samples()[s][b];
         merged[s][b].insert(merged[s][b].end(), src.begin(), src.end());
@@ -295,8 +417,14 @@ inline void print(std::ostream& os) {
     for (auto* thread : registry()) {
       if (thread == nullptr)
         continue;
+      std::lock_guard snapshot_lock(thread->snapshot_mutex);
       for (std::size_t s = 0; s < merged.size(); ++s) {
         total_counters[s] += thread->counters[s];
+        if (is_polling_stage(s)) {
+          merge_polling_samples(merged[s][0], polling_seen[s], thread->samples[s][0],
+                                thread->polling_seen[s], polling_rng);
+          continue;
+        }
         for (std::size_t b = 0; b < bucket_count; ++b) {
           auto& src = thread->samples[s][b];
           merged[s][b].insert(merged[s][b].end(), src.begin(), src.end());
@@ -386,8 +514,9 @@ inline void print(std::ostream& os) {
       os << (last ? "└─ " : "├─ ");
     os << std::left << std::setw(28) << label << " n=" << std::right
        << std::setw(8) << st.sampled << " avg=" << std::setw(10) << st.avg
-       << " p50=" << std::setw(10) << st.p50 << " p99=" << std::setw(10)
-       << st.p99 << " max=" << std::setw(10) << st.max << "\n";
+       << " p50=" << std::setw(10) << st.p50 << " p90=" << std::setw(10)
+       << st.p90 << " p99=" << std::setw(10) << st.p99
+       << " p999=" << std::setw(10) << st.p999 << " max=" << std::setw(10) << st.max << "\n";
   };
   auto has = [&](std::size_t s) {
     return total_counters[s] > 0;
@@ -411,6 +540,31 @@ inline void print(std::ostream& os) {
          << " max=" << std::setw(10) << bst.max << "\n";
     }
   };
+
+  // Additional scheduling and poller stages are independent measurements.
+  os << "\n[scheduling_and_polling]\n";
+  for (auto id = static_cast<std::size_t>(stage::client_write_mutex_wait);
+       id < static_cast<std::size_t>(stage::count); ++id) {
+    if (!has(id))
+      continue;
+    auto value = compute(id);
+    if (id == static_cast<std::size_t>(stage::urma_poll_completions)) {
+      // Stored unscaled; unlike duration stages, these samples count CQEs.
+      value.avg *= 1000;
+      value.p50 *= 1000;
+      value.p90 *= 1000;
+      value.p99 *= 1000;
+      value.p999 *= 1000;
+      value.max *= 1000;
+      os << "unit=count ";
+    }
+    node(0, true, stage_names[id], value);
+    if (is_polling_stage(id)) {
+      os << "  sampling=reservoir eligible=" << polling_seen[id]
+         << " retained=" << value.sampled << " limit=" << polling_sample_limit
+         << " dropped=" << (polling_seen[id] - value.sampled) << "\n";
+    }
+  }
 
   // ── Benchmark ──
   if (has(static_cast<std::size_t>(stage::benchmark_rpc_call))) {
@@ -549,4 +703,171 @@ inline void print(std::ostream& os) {
   }
 }
 
+
+// Process configuration is read once. An invalid value retains the default.
+inline uint64_t slow_threshold_ns() {
+  static const uint64_t value = [] {
+    const char* env = std::getenv("YLT_RPC_TRACE_SLOW_US");
+    uint64_t us = 1000;
+    if (env && *env) {
+      uint64_t parsed = 0;
+      bool valid = true;
+      for (const char* p = env; *p; ++p) {
+        if (*p < '0' || *p > '9' ||
+            parsed > (std::numeric_limits<uint64_t>::max() / 1000 -
+                      static_cast<unsigned>(*p - '0')) / 10) {
+          valid = false;
+          break;
+        }
+        parsed = parsed * 10 + (*p - '0');
+      }
+      if (valid) us = parsed;
+    }
+    return us * 1000;
+  }();
+  return value;
+}
+
+// Shared only by continuations for one request, never by unrelated requests.
+struct request_trace {
+  std::array<std::atomic<uint64_t>, static_cast<std::size_t>(stage::count)>
+      durations{};
+  std::atomic<uint64_t> response_ready_ns{0};
+  std::atomic<bool> reported{false};
+  std::atomic<bool> dispatch_done{false};
+  std::atomic<uint64_t> response_end_ns{0};
+  enum class server_result { ok, send_error, read_error };
+  std::atomic<server_result> response_status{server_result::ok};
+  // Set before a synchronous context handler publishes its context.
+  std::thread::id synchronous_handler_thread;
+  std::atomic<uint64_t> inline_serialization_ns{0};
+  const uint64_t begin_ns = now_ns();
+  uint64_t owner_id;
+  uint32_t seq_num;
+  std::string rpc;
+  bool server;
+
+  request_trace(uint64_t owner, uint32_t seq, std::string_view name,
+                bool is_server)
+      : owner_id(owner), seq_num(seq), rpc(name), server(is_server) {}
+
+  void add(stage id, uint64_t duration) {
+    durations[static_cast<std::size_t>(id)].fetch_add(
+        duration, std::memory_order_relaxed);
+  }
+
+  void finish_read_error() {
+    dispatch_done.store(true, std::memory_order_release);
+    finish("read_error");
+  }
+
+  void finish(const char* status = "ok") {
+    auto end = now_ns();
+    if (server) {
+      if (!response_end_ns.load(std::memory_order_acquire)) {
+        auto result = std::string_view(status) == "ok" ? server_result::ok :
+            std::string_view(status) == "read_error" ? server_result::read_error :
+                                                     server_result::send_error;
+        response_status.store(result);
+        response_end_ns.store(end, std::memory_order_release);
+      }
+      if (!dispatch_done.load(std::memory_order_acquire))
+        return;
+      end = response_end_ns.load();
+      auto result = response_status.load();
+      status = result == server_result::ok ? "ok" :
+          result == server_result::read_error ? "read_error" : "send_error";
+    }
+    auto threshold = slow_threshold_ns();
+    if (!threshold || end - begin_ns < threshold || reported.exchange(true))
+      return;
+    std::ostringstream out;
+    out << "ylt_rpc_slow side=" << (server ? "server" : "client")
+        << (server ? " conn_id=" : " client_id=") << owner_id
+        << " request_id=" << seq_num << " seq_num=" << seq_num
+        << " rpc=" << std::quoted(rpc) << " total_us="
+        << std::fixed << std::setprecision(3) << (end - begin_ns) / 1000.0
+        << " status=" << status;
+    if (server)
+      out << " header_wait_in_total=0";
+    auto first = server ? stage::server_read_header : stage::client_prepare_request;
+    auto last = server ? stage::server_send_response : stage::client_deserialize_response;
+    for (auto i = static_cast<std::size_t>(first);
+         i <= static_cast<std::size_t>(last); ++i) {
+      out << ' ' << stage_names[i] << "_us=" << durations[i].load() / 1000.0;
+    }
+    if (!server) {
+      for (auto id : {stage::client_write_mutex_wait, stage::client_wait_send_slot,
+                      stage::client_response_resume}) {
+        out << ' ' << stage_names[static_cast<std::size_t>(id)] << "_us="
+            << durations[static_cast<std::size_t>(id)].load() / 1000.0;
+      }
+    }
+    auto line = out.str();
+    std::fprintf(stderr, "%s\n", line.c_str());
+  }
+};
+
+inline std::shared_ptr<request_trace> make_trace(uint64_t owner, uint32_t seq,
+                                                std::string_view name,
+                                                bool server = false) {
+  if (!enabled() && !slow_threshold_ns())
+    return {};
+  return std::make_shared<request_trace>(owner, seq, name, server);
+}
+
+// Explicit finish separates adjacent phases; destruction records error paths.
+class stage_sample {
+ public:
+  stage_sample(stage id, request_trace* trace = nullptr, std::size_t size = 0,
+               bool force = false)
+      : id_(id),
+        trace_(trace),
+        size_(size),
+        begin_((trace || force || enabled()) ? now_ns() : 0) {}
+  stage_sample(const stage_sample&) = delete;
+  ~stage_sample() { finish(); }
+  void exclude_inline_serialization() {
+    if (!trace_)
+      return;
+    trace_->synchronous_handler_thread = std::this_thread::get_id();
+    excluded_begin_ = trace_->inline_serialization_ns.load();
+    exclude_inline_ = true;
+  }
+  uint64_t finish() {
+    if (!begin_)
+      return 0;
+    auto duration = now_ns() - begin_;
+    if (trace_ && id_ == stage::server_serialize_result &&
+        trace_->synchronous_handler_thread == std::this_thread::get_id()) {
+      trace_->inline_serialization_ns.fetch_add(duration);
+    }
+    if (exclude_inline_) {
+      auto excluded = trace_->inline_serialization_ns.load() - excluded_begin_;
+      duration -= std::min(duration, excluded);
+    }
+    if (trace_)
+      trace_->add(id_, duration);
+    record_with_size(id_, duration, size_);
+    begin_ = 0;
+    if (trace_ && trace_->server && id_ == stage::server_dispatch) {
+      trace_->dispatch_done.store(true, std::memory_order_release);
+      if (trace_->response_end_ns.load())
+        trace_->finish();
+    }
+    return duration;
+  }
+ private:
+  stage id_;
+  request_trace* trace_;
+  std::size_t size_;
+  uint64_t begin_;
+  uint64_t excluded_begin_ = 0;
+  bool exclude_inline_ = false;
+};
+
 }  // namespace coro_io::urma_benchmark_profile
+
+namespace coro_rpc {
+namespace rpc_profile = coro_io::urma_benchmark_profile;
+}

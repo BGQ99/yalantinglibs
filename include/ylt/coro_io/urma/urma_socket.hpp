@@ -118,6 +118,7 @@ struct urma_socket_shared_state_t
   struct pending_recv {
     std::pair<std::error_code, std::size_t> result;
     urma_buffer_t buffer;
+    uint64_t detected_ns = 0;
   };
 
   urma_socket_shared_state_t(std::shared_ptr<urma_device_wrapper_t> device,
@@ -137,8 +138,14 @@ struct urma_socket_shared_state_t
   ~urma_socket_shared_state_t() { release_resources(); }
 
   static void resume(std::pair<std::error_code, std::size_t> result,
-                     callback_t&& callback) {
+                     callback_t&& callback, uint64_t detected_ns = 0) {
     if (callback) {
+      if (detected_ns)
+        urma_benchmark_profile::record_since(
+            urma_benchmark_profile::stage::urma_completion_detect_to_callback,
+            detected_ns);
+      urma_benchmark_profile::stage_sample sample(
+          urma_benchmark_profile::stage::urma_completion_callback);
       auto cb = std::move(callback);
       cb(std::move(result));
     }
@@ -385,7 +392,7 @@ struct urma_socket_shared_state_t
     if (!recv_result_.empty()) {
       auto pending = recv_result_.pop();
       recv_buffer_ = std::move(pending.buffer);
-      resume(std::move(pending.result), std::move(callback));
+      resume(std::move(pending.result), std::move(callback), pending.detected_ns);
     }
     else if (has_close_) {
       resume({std::make_error_code(std::errc::operation_canceled), 0},
@@ -397,15 +404,21 @@ struct urma_socket_shared_state_t
   }
 
   std::pair<std::error_code, std::size_t> poll_completion() {
+    urma_benchmark_profile::stage_sample round_sample(
+        urma_benchmark_profile::stage::urma_poll_round);
     std::array<urma_cr_t, 16> completions{};
     int count = 0;
     std::size_t polled = 0;
     do {
+      urma_benchmark_profile::stage_sample call_sample(
+          urma_benchmark_profile::stage::urma_poll_call);
       count = urma_poll_jfc(jfc_.get(), static_cast<int>(completions.size()),
                             completions.data());
+      call_sample.finish();
       if (count < 0)
         return {std::make_error_code(std::errc::io_error), polled};
       polled += static_cast<std::size_t>(count);
+      auto detected_ns = urma_benchmark_profile::enabled() ? urma_benchmark_profile::now_ns() : 0;
       for (int i = 0; i < count; ++i) {
         auto& cr = completions[i];
         auto ec = cr.status == URMA_CR_SUCCESS
@@ -426,7 +439,7 @@ struct urma_socket_shared_state_t
           auto pending = send_callbacks_.pop();
           if (pending.buffer)
             buffer_pool_->return_buffer(pending.buffer);
-          resume({ec, pending.length}, std::move(pending.callback));
+          resume({ec, pending.length}, std::move(pending.callback), detected_ns);
           wake_writer(ec);
           continue;
         }
@@ -438,7 +451,7 @@ struct urma_socket_shared_state_t
           has_close_ = true;
           if (recv_callback_) {
             resume({std::make_error_code(std::errc::connection_reset), 0},
-                   std::move(recv_callback_));
+                   std::move(recv_callback_), detected_ns);
           }
           continue;
         }
@@ -451,7 +464,7 @@ struct urma_socket_shared_state_t
         }
         if (recv_callback_) {
           recv_buffer_ = std::move(completed_buffer);
-          resume({ec, cr.completion_len}, std::move(recv_callback_));
+          resume({ec, cr.completion_len}, std::move(recv_callback_), detected_ns);
         }
         else {
           if (recv_result_.full()) {
@@ -461,19 +474,31 @@ struct urma_socket_shared_state_t
             return {std::make_error_code(std::errc::no_buffer_space), polled};
           }
           recv_result_.push(pending_recv{{ec, cr.completion_len},
-                                         std::move(completed_buffer)});
+                                         std::move(completed_buffer), detected_ns});
         }
       }
     } while (count == static_cast<int>(completions.size()));
+    urma_benchmark_profile::record(
+        urma_benchmark_profile::stage::urma_poll_completions, polled);
     return {{}, polled};
   }
 
   void start_polling() {
     auto self = shared_from_this();
     poll_timer_.expires_after(idle_poll_interval_);
-    poll_timer_.async_wait([self](const std::error_code& ec) {
+    const auto due = urma_benchmark_profile::enabled()
+        ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+              poll_timer_.expiry().time_since_epoch()).count())
+        : 0;
+    poll_timer_.async_wait([self, due](const std::error_code& ec) {
       if (ec || self->has_close_)
         return;
+      if (due) {
+        auto now = urma_benchmark_profile::now_ns();
+        urma_benchmark_profile::record(
+            urma_benchmark_profile::stage::urma_timer_wakeup_delay,
+            now > due ? now - due : 0);
+      }
       self->poll_once();
     });
   }
@@ -499,9 +524,13 @@ struct urma_socket_shared_state_t
     }
     --active_poll_budget_;
     auto self = shared_from_this();
-    asio::post(executor_->get_asio_executor(), [self] {
+    auto posted = urma_benchmark_profile::enabled() ? urma_benchmark_profile::now_ns() : 0;
+    asio::post(executor_->get_asio_executor(), [self, posted] {
       if (self->has_close_)
         return;
+      if (posted)
+        urma_benchmark_profile::record_since(
+            urma_benchmark_profile::stage::urma_post_queue_delay, posted);
       self->poll_once();
     });
   }

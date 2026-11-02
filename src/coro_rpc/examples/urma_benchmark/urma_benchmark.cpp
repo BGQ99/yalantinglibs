@@ -37,9 +37,12 @@
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/io_context_pool.hpp"
 #include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
+#include "ylt/coro_io/urma/urma_priority.hpp"
+#ifdef YLT_ENABLE_URMA
 #include "ylt/coro_io/urma/urma_device.hpp"
 #include "ylt/coro_io/urma/urma_io.hpp"
 #include "ylt/coro_io/urma/urma_socket.hpp"
+#endif
 #include "ylt/coro_rpc/coro_rpc_client.hpp"
 #include "ylt/coro_rpc/coro_rpc_server.hpp"
 #include "ylt/easylog.hpp"
@@ -48,6 +51,9 @@
 using namespace async_simple::coro;
 using namespace coro_rpc;
 using namespace std::chrono_literals;
+
+uint32_t sized_response_payload = 0;
+std::string bench_sized(std::string_view) { return std::string(sized_response_payload, 'x'); }
 
 std::string_view bench_echo(std::string_view data) { return data; }
 uint64_t bench_sink(std::string_view data) { return data.size(); }
@@ -74,6 +80,12 @@ struct options_t {
   int eid_index = 0;
   std::string event_mode = "true";
   uint32_t payload_size = 64;
+  uint32_t request_bytes = 0;
+  uint32_t response_bytes = 0;
+  uint32_t response_payload = 64;
+  uint32_t qps = 983;
+  uint32_t duration_ms = 30500;
+  uint32_t server_duration_ms = 0;
   uint32_t latency_iters = 10000;
   uint32_t warmup_iters = 1000;
   uint32_t concurrency = 64;
@@ -145,13 +157,16 @@ void print_usage(const char* program) {
          "Default 256, auto-raised when needed\n"
       << "  --no-urma               Use TCP instead of URMA RPC. Default URMA\n"
       << "  --event-mode <true|false> URMA event mode. Default true\n"
-      << "  --profile                Enable in-memory stage latency profiling. "
-         "Default off\n"
+      << "  --profile / --no-profile Override YLT_RPC_PROFILE_ENABLE; default "
+         "off when unset\n"
       << "  --profile-sample-rate <n> Record one sample every n events per "
          "stage/thread. Default 1\n"
       << "  --log <trace|debug|info|warn|error> Default info\n\n"
       << "Client options:\n"
-      << "  --mode <latency|throughput|both> Default both\n"
+      << "  --mode <latency|throughput|both|paced> Default both\n"
+      << "  --qps <n> --duration-ms <n> Paced serial single-connection test; defaults 983/30500\n"
+      << "  --rpc sized --request-bytes <n> --response-bytes <n> Exact RPC "
+         "message sizes, including headers; set on both peers\n"
       << "  --rpc <echo|sink|attach_sink> echo returns payload; sink returns "
          "payload size; attach_sink uses request attachment. Default echo\n"
       << "  --latency-iters <n>      Low-load serial requests. Default 10000\n"
@@ -168,6 +183,8 @@ void print_usage(const char* program) {
       << "  --client-threads <n>     Client executor threads. Default "
          "hardware\n\n"
       << "Server options:\n"
+      << "  --server-duration-ms <n> Stop cleanly after n ms and print profile; "
+         "default 0 runs until stopped\n"
       << "  --server-threads <n>     Server threads. Default hardware\n\n"
       << "Examples:\n"
       << "  same node server: " << program
@@ -190,6 +207,13 @@ uint64_t parse_u64(std::string_view value, std::string_view name) {
   return result;
 }
 
+uint32_t parse_u32(std::string_view value, std::string_view name) {
+  auto number = parse_u64(value, name);
+  if (number > std::numeric_limits<uint32_t>::max())
+    throw std::invalid_argument("option exceeds uint32: " + std::string(name));
+  return static_cast<uint32_t>(number);
+}
+
 easylog::Severity parse_log_level(std::string_view value) {
   if (value == "trace")
     return easylog::Severity::TRACE;
@@ -206,6 +230,9 @@ easylog::Severity parse_log_level(std::string_view value) {
 
 options_t parse_options(int argc, char** argv) {
   options_t opt;
+  coro_io::urma_benchmark_profile::init_from_env();
+  opt.profile = coro_io::urma_benchmark_profile::enabled();
+  opt.profile_sample_rate = coro_io::urma_benchmark_profile::sample_rate_value().load();
   if (argc >= 2)
     opt.role = argv[1];
   if (opt.role != "server" && opt.role != "client") {
@@ -246,6 +273,18 @@ options_t parse_options(int argc, char** argv) {
     else if (key == "--payload") {
       opt.payload_size = static_cast<uint32_t>(parse_u64(require_value(), key));
     }
+    else if (key == "--request-bytes") {
+      opt.request_bytes = parse_u32(require_value(), key);
+    }
+    else if (key == "--response-bytes") {
+      opt.response_bytes = parse_u32(require_value(), key);
+    }
+    else if (key == "--qps") {
+      opt.qps = parse_u32(require_value(), key);
+    }
+    else if (key == "--duration-ms") {
+      opt.duration_ms = parse_u32(require_value(), key);
+    }
     else if (key == "--buffer-size") {
       opt.buffer_size = static_cast<uint32_t>(parse_u64(require_value(), key));
     }
@@ -263,6 +302,9 @@ options_t parse_options(int argc, char** argv) {
     }
     else if (key == "--profile") {
       opt.profile = true;
+    }
+    else if (key == "--no-profile") {
+      opt.profile = false;
     }
     else if (key == "--no-urma") {
       opt.use_urma = false;
@@ -311,6 +353,9 @@ options_t parse_options(int argc, char** argv) {
       opt.duration_seconds =
           static_cast<uint32_t>(parse_u64(require_value(), key));
     }
+    else if (key == "--server-duration-ms") {
+      opt.server_duration_ms = parse_u32(require_value(), key);
+    }
     else if (key == "--raw-report-interval") {
       opt.raw_report_interval_seconds =
           static_cast<uint32_t>(parse_u64(require_value(), key));
@@ -331,15 +376,48 @@ options_t parse_options(int argc, char** argv) {
     }
   }
 
-  if (opt.mode != "latency" && opt.mode != "throughput" && opt.mode != "both") {
-    throw std::invalid_argument("--mode must be latency, throughput, or both");
+  if (opt.mode != "latency" && opt.mode != "throughput" && opt.mode != "both" &&
+      opt.mode != "paced") {
+    throw std::invalid_argument("--mode must be latency, throughput, both, or paced");
   }
   if (opt.transport != "rpc" && opt.transport != "raw") {
     throw std::invalid_argument("--transport must be rpc or raw");
   }
-  if (opt.rpc != "echo" && opt.rpc != "sink" && opt.rpc != "attach_sink") {
-    throw std::invalid_argument("--rpc must be echo, sink, or attach_sink");
+  if (opt.rpc != "echo" && opt.rpc != "sink" && opt.rpc != "attach_sink" &&
+      opt.rpc != "sized") {
+    throw std::invalid_argument("--rpc must be echo, sink, attach_sink, or sized");
   }
+  if (opt.mode == "paced" &&
+      (!opt.qps || opt.qps > 1000000000 || !opt.duration_ms ||
+       opt.transport != "rpc")) {
+    throw std::invalid_argument(
+        "paced mode requires RPC, positive duration and qps in [1, 1000000000]");
+  }
+  auto payload_for_bytes = [](uint32_t bytes, uint32_t head) -> uint32_t {
+    if (bytes > 16 * 1024 * 1024)
+      throw std::invalid_argument("sized RPC limited to 16 MiB");
+    for (uint32_t size = bytes > head + 32 ? bytes - head - 32 : 0;
+         size <= bytes; ++size) {
+      std::string payload(size, 'x');
+      if (head + struct_pack::serialize(std::string_view(payload)).size() == bytes)
+        return size;
+    }
+    throw std::invalid_argument("requested wire size is not representable");
+  };
+  if (opt.request_bytes || opt.response_bytes) {
+    if (opt.rpc != "sized")
+      throw std::invalid_argument("wire size options require --rpc sized");
+    using protocol = coro_rpc::protocol::coro_rpc_protocol;
+    if (opt.request_bytes)
+      opt.payload_size = payload_for_bytes(opt.request_bytes, protocol::REQ_HEAD_LEN);
+    if (opt.response_bytes)
+      opt.response_payload = payload_for_bytes(opt.response_bytes, protocol::RESP_HEAD_LEN);
+  }
+  if (opt.mode == "paced" && (opt.connections != 1 || opt.pipeline_depth != 1)) {
+    throw std::invalid_argument(
+        "paced mode requires --connections 1 --pipeline-depth 1");
+  }
+  sized_response_payload = opt.response_payload;
   opt.connections = std::max<uint32_t>(opt.connections, 1);
   opt.pipeline_depth = std::max<uint32_t>(opt.pipeline_depth, 1);
   opt.concurrency = std::max<uint32_t>(opt.concurrency, opt.connections);
@@ -386,6 +464,7 @@ uint64_t effective_pool_memory_usage(const options_t& opt) {
   return std::max(opt.max_memory_usage, estimated_pool_memory_usage(opt));
 }
 
+#ifdef YLT_ENABLE_URMA
 coro_io::urma_socket_t::config_t make_urma_config(const options_t& opt) {
   return coro_io::urma_socket_t::config_t{
       .cq_size = static_cast<uint32_t>(opt.queue_depth * 2 + 8),
@@ -430,6 +509,12 @@ bool init_global_urma(const options_t& opt) {
             << std::endl;
   return true;
 }
+
+#else
+bool init_global_urma(const options_t&) {
+  throw std::invalid_argument("URMA support is not compiled; use --no-urma");
+}
+#endif
 
 Lazy<bool> connect_client(coro_rpc_client& client, const options_t& opt,
                           uint32_t client_index = 0) {
@@ -491,6 +576,13 @@ Lazy<bool> issue_rpc_call(coro_rpc_client& client, const std::string& payload,
     }
     co_return ok;
   }
+  if (rpc == "sized") {
+    auto result = co_await client.call_for<bench_sized>(30s, payload);
+    ok = result && result.value().size() == sized_response_payload;
+    if (profile_call) coro_io::urma_benchmark_profile::record_since_with_size(
+        coro_io::urma_benchmark_profile::stage::benchmark_rpc_call, profile_begin, payload_size);
+    co_return ok;
+  }
   if (rpc == "sink") {
     auto result = co_await client.call_for<bench_sink>(30s, payload);
     ok = result && result.value() == payload.size();
@@ -511,7 +603,8 @@ Lazy<bool> issue_rpc_call(coro_rpc_client& client, const std::string& payload,
   co_return ok;
 }
 
-void print_latency_result(std::vector<uint64_t>& samples) {
+template <typename T>
+void print_latency_result(std::vector<T>& samples) {
   if (samples.empty()) {
     std::cout << "latency: no samples\n";
     return;
@@ -521,7 +614,7 @@ void print_latency_result(std::vector<uint64_t>& samples) {
     auto index = static_cast<std::size_t>((samples.size() - 1) * p);
     return samples[index];
   };
-  auto sum = std::accumulate(samples.begin(), samples.end(), uint64_t{0});
+  auto sum = std::accumulate(samples.begin(), samples.end(), 0.0);
   auto avg = static_cast<double>(sum) / static_cast<double>(samples.size());
   std::cout << std::fixed << std::setprecision(2)
             << "latency_us count=" << samples.size() << " avg=" << avg
@@ -560,6 +653,48 @@ Lazy<void> run_latency(const options_t& opt, const std::string& payload) {
   coro_io::urma_benchmark_profile::configure(false, opt.profile_sample_rate);
   print_latency_result(samples);
   status("latency test finished");
+}
+
+// One outstanding request, paced against an absolute schedule. Report schedule
+// lag separately: a late response must not silently reset the load generator.
+Lazy<void> run_paced(const options_t& opt, const std::string& payload) {
+  coro_rpc_client client;
+  if (!(co_await connect_client(client, opt)) ||
+      !(co_await warmup(client, payload, opt.warmup_iters, opt.rpc)))
+    throw std::runtime_error("paced connection or warmup failed");
+  coro_io::urma_benchmark_profile::configure(opt.profile, opt.profile_sample_rate);
+  std::vector<double> samples;
+  auto begin = std::chrono::steady_clock::now();
+  auto deadline = begin + std::chrono::milliseconds(opt.duration_ms);
+  uint64_t count = 0, late = 0, max_lag_ns = 0;
+  coro_io::period_timer timer(coro_io::get_global_executor()->get_asio_executor());
+  while (true) {
+    auto due = begin + std::chrono::seconds(count / opt.qps) +
+               std::chrono::nanoseconds((count % opt.qps) * 1000000000ull / opt.qps);
+    if (due >= deadline) break;
+    timer.expires_at(due);
+    co_await timer.async_await();
+    auto start = std::chrono::steady_clock::now();
+    if (start >= deadline) break;
+    auto lag = std::chrono::duration_cast<std::chrono::nanoseconds>(start - due).count();
+    max_lag_ns = std::max(max_lag_ns, static_cast<uint64_t>(std::max<int64_t>(lag, 0)));
+    if (lag >= 1000000000ull / opt.qps) ++late;
+    if (!(co_await issue_rpc_call(client, payload, opt.rpc)))
+      throw std::runtime_error("paced RPC failed");
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    samples.push_back(std::chrono::duration<double, std::micro>(elapsed).count());
+    ++count;
+  }
+  auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+  std::cout << "paced requests=" << count << " duration_s=" << seconds
+            << " qps=" << count / seconds << " missed_periods=" << late
+            << " max_schedule_lag_us=" << max_lag_ns / 1000.0
+            << " slow_ge_1000us="
+            << std::count_if(samples.begin(), samples.end(),
+                             [](auto us) { return us >= 1000; })
+            << '\n';
+  print_latency_result(samples);
+  coro_io::urma_benchmark_profile::configure(false, opt.profile_sample_rate);
 }
 
 struct worker_result_t {
@@ -654,6 +789,7 @@ Lazy<void> run_throughput(const options_t& opt, const std::string& payload) {
   status("throughput test finished");
 }
 
+#ifdef YLT_ENABLE_URMA
 struct raw_result_t {
   uint64_t messages = 0;
   uint64_t errors = 0;
@@ -793,6 +929,17 @@ Lazy<void> run_raw_client(const options_t& opt, const std::string& payload) {
   status("raw URMA throughput test finished");
 }
 
+#else
+Lazy<void> run_raw_server(const options_t&) {
+  throw std::invalid_argument("raw transport requires URMA support");
+  co_return;
+}
+Lazy<void> run_raw_client(const options_t&, const std::string&) {
+  throw std::invalid_argument("raw transport requires URMA support");
+  co_return;
+}
+#endif
+
 int run_server(const options_t& opt) {
   if (opt.transport == "raw") {
     syncAwait(run_raw_server(opt));
@@ -815,6 +962,7 @@ int run_server(const options_t& opt) {
   }
   coro_rpc_server server(opt.server_threads, opt.port, opt.host);
   server.register_handler<bench_echo>();
+  server.register_handler<bench_sized>();
   server.register_handler<bench_sink>();
   server.register_handler<bench_attachment_sink>();
   std::cout << (opt.use_urma ? "URMA" : "TCP")
@@ -825,6 +973,14 @@ int run_server(const options_t& opt) {
             << ", queue_depth=" << opt.queue_depth << ", max_memory_mib="
             << effective_pool_memory_usage(opt) / 1024 / 1024 << std::endl;
   status("entering server event loop");
+  if (opt.server_duration_ms) {
+    auto running = server.async_start();
+    if (running.hasResult()) return 1;
+    syncAwait(coro_io::sleep_for(std::chrono::milliseconds(opt.server_duration_ms),
+                                coro_io::get_global_executor(1)));
+    server.stop();
+    return 0;
+  }
   return !server.start();
 }
 
@@ -864,6 +1020,8 @@ int run_client(const options_t& opt) {
             << ", buffer_size=" << opt.buffer_size
             << ", queue_depth=" << opt.queue_depth << std::endl;
 
+  if (opt.mode == "paced")
+    syncAwait(run_paced(opt, payload));
   if (opt.mode == "latency" || opt.mode == "both") {
     syncAwait(run_latency(opt, payload));
   }
@@ -880,7 +1038,8 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     auto opt = parse_options(argc, argv);
-    coro_io::urma_benchmark_profile::configure(false, opt.profile_sample_rate);
+    coro_io::urma_benchmark_profile::configure(
+        opt.role == "server" && opt.profile, opt.profile_sample_rate);
     easylog::logger<>::instance().set_min_severity(opt.log_level);
     easylog::logger<>::instance().set_async(false);
     if (opt.role == "server")

@@ -241,12 +241,17 @@ class router {
              std::string_view data,
              typename rpc_protocol::supported_serialize_protocols protocols,
              const typename rpc_protocol::route_key_t &route_key) {
+    auto* local = co_await async_simple::coro::CurrentLazyLocals<
+        coro_connection::connection_lazy_ctx<rpc_protocol>>{};
+    auto profile = local ? local->info_->profile() : nullptr;
+    rpc_profile::stage_sample dispatch_sample(
+        rpc_profile::stage::server_dispatch, profile.get());
     using namespace std::string_literals;
     if (handler)
       AS_LIKELY {
         try {
 #ifndef NDEBUG
-          ELOG_INFO << "route function name: " << get_name(route_key)
+          ELOG_DEBUG << "route function name: " << get_name(route_key)
                     << " conn_id " << conn_id << ",request ID:" << req_id;
 #endif
           // clang-format off
@@ -271,12 +276,14 @@ class router {
       rpc_context<rpc_protocol> &context_info,
       typename rpc_protocol::supported_serialize_protocols protocols,
       const typename rpc_protocol::route_key_t &route_key) {
+    rpc_profile::stage_sample dispatch_sample(
+        rpc_profile::stage::server_dispatch, context_info->profile().get());
     using namespace std::string_literals;
     if (handler)
       AS_LIKELY {
         try {
 #ifndef NDEBUG
-          ELOG_INFO << "route function name: " << get_name(route_key) << " conn_id " << conn_id << ",request ID:" << req_id;
+          ELOG_DEBUG << "route function name: " << get_name(route_key) << " conn_id " << conn_id << ",request ID:" << req_id;
 #endif
           return (*handler)(data, context_info, protocols);
         } catch (coro_rpc::rpc_error& err) {

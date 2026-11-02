@@ -4,6 +4,7 @@ set(TEST_SRCS
         test_acceptor.cpp
         test_coro_rpc_server.cpp
         test_coro_rpc_client.cpp
+        test_rpc_profile.cpp
         test_register_handler.cpp
         test_router.cpp
         test_connection.cpp

@@ -40,11 +40,16 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
-  std::queue<std::pair<std::error_code, std::size_t>> completions;
+  struct completion {
+    std::pair<std::error_code, std::size_t> result;
+    uint64_t ready_ns;
+  };
+  std::queue<completion> completions;
   async_simple::util::move_only_function<void()> resume_handler;
 
   void push(std::pair<std::error_code, std::size_t> result) {
-    completions.push(result);
+    completions.push({result, urma_benchmark_profile::enabled()
+                                  ? urma_benchmark_profile::now_ns() : 0});
     if (resume_handler) {
       auto h = std::move(resume_handler);
       resume_handler = nullptr;
@@ -69,9 +74,12 @@ wait_urma_write_completion(
       };
     });
   }
-  auto result = state->completions.front();
+  auto completed = state->completions.front();
   state->completions.pop();
-  co_return result;
+  if (completed.ready_ns)
+    urma_benchmark_profile::record_since(
+        urma_benchmark_profile::stage::urma_completion_resume, completed.ready_ns);
+  co_return completed.result;
 }
 
 template <typename Buffer>
@@ -94,12 +102,24 @@ async_urma_read(urma_socket_t& socket, Buffer&& raw_buffer, bool read_some) {
       auto wait_begin = urma_benchmark_profile::enabled()
                             ? urma_benchmark_profile::now_ns()
                             : 0;
+      uint64_t ready_ns = 0;
       auto [ec, length] =
           co_await async_io<std::pair<std::error_code, std::size_t>>(
               [&](auto&& callback) {
-                socket.post_recv(std::move(callback));
+                if (urma_benchmark_profile::enabled()) {
+                  socket.post_recv([&ready_ns, cb = std::move(callback)](auto result) mutable {
+                    ready_ns = urma_benchmark_profile::now_ns();
+                    cb(result);
+                  });
+                }
+                else {
+                  socket.post_recv(std::move(callback));
+                }
               },
               socket);
+      if (ready_ns)
+        urma_benchmark_profile::record_since(
+            urma_benchmark_profile::stage::urma_completion_resume, ready_ns);
       urma_benchmark_profile::record_since_with_size(
           urma_benchmark_profile::stage::urma_read_wait_completion, wait_begin,
           length);
@@ -142,12 +162,24 @@ async_urma_read_views(urma_socket_t& socket, std::size_t size) {
     auto wait_begin = urma_benchmark_profile::enabled()
                           ? urma_benchmark_profile::now_ns()
                           : 0;
+    uint64_t ready_ns = 0;
     auto [ec, length] =
         co_await async_io<std::pair<std::error_code, std::size_t>>(
             [&](auto&& callback) {
-              socket.post_recv(std::move(callback));
+              if (urma_benchmark_profile::enabled()) {
+                socket.post_recv([&ready_ns, cb = std::move(callback)](auto result) mutable {
+                  ready_ns = urma_benchmark_profile::now_ns();
+                  cb(result);
+                });
+              }
+              else {
+                socket.post_recv(std::move(callback));
+              }
             },
             socket);
+    if (ready_ns)
+      urma_benchmark_profile::record_since(
+          urma_benchmark_profile::stage::urma_completion_resume, ready_ns);
     urma_benchmark_profile::record_since_with_size(
         urma_benchmark_profile::stage::urma_read_wait_completion, wait_begin,
         length);

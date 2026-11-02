@@ -88,7 +88,7 @@ class context_base {
           << "request id:" << self_->get_request_id();
     self_->conn_->template response_error<rpc_protocol>(
         time_point_, self_->get_request_id(), error_code, error_msg,
-        self_->req_head_, std::move(self_->complete_handler_));
+        self_->req_head_, std::move(self_->complete_handler_), self_->profile_);
   }
   void response_error(coro_rpc::err_code error_code) {
     response_error(error_code, error_code.message());
@@ -112,11 +112,14 @@ class context_base {
       static_assert(sizeof...(args) == 0, "illegal args");
       std::visit(
           [&]<typename serialize_proto>(const serialize_proto &) {
+            rpc_profile::stage_sample sample(rpc_profile::stage::server_serialize_result, self_->profile_.get());
+            auto body = serialize_proto::serialize();
+            sample.finish();
             self_->conn_->template response_msg<rpc_protocol>(
                 time_point_, self_->get_request_id(),
-                serialize_proto::serialize(),
+                std::move(body),
                 std::move(self_->resp_attachment_), self_->req_head_,
-                std::move(self_->complete_handler_));
+                std::move(self_->complete_handler_), self_->profile_);
           },
           *rpc_protocol::get_serialize_protocol(self_->req_head_));
     }
@@ -127,11 +130,14 @@ class context_base {
       return_msg_type ret{std::forward<Args>(args)...};
       std::visit(
           [&]<typename serialize_proto>(const serialize_proto &) {
+            rpc_profile::stage_sample sample(rpc_profile::stage::server_serialize_result, self_->profile_.get());
+            auto body = serialize_proto::serialize(ret);
+            sample.finish();
             self_->conn_->template response_msg<rpc_protocol>(
                 time_point_, self_->get_request_id(),
-                serialize_proto::serialize(ret),
+                std::move(body),
                 std::move(self_->resp_attachment_), self_->req_head_,
-                std::move(self_->complete_handler_));
+                std::move(self_->complete_handler_), self_->profile_);
           },
           *rpc_protocol::get_serialize_protocol(self_->req_head_));
 

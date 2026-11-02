@@ -33,6 +33,16 @@
 #include "ylt/util/type_traits.h"
 
 namespace coro_rpc::internal {
+// The arguments (including an awaited handler result) are evaluated before
+// entering this function, keeping handler time out of serialization time.
+template <typename Serialize, typename... Args>
+auto serialize_result(rpc_profile::stage_sample& handler,
+                      rpc_profile::request_trace* profile, Args&&... args) {
+  handler.finish();
+  rpc_profile::stage_sample sample(rpc_profile::stage::server_serialize_result, profile);
+  return Serialize::serialize(std::forward<Args>(args)...);
+}
+
 // TODO: remove this later
 template <bool is_conn, typename First>
 auto get_return_type() {
@@ -58,6 +68,9 @@ template <typename rpc_protocol, typename serialize_proto, auto func,
 inline std::pair<coro_rpc::err_code, std::string> execute(
     std::string_view data, rpc_context<rpc_protocol> &context_info,
     Self *self = nullptr) {
+  auto* profile = context_info->profile().get();
+  rpc_profile::stage_sample deserialize_sample(
+      rpc_profile::stage::server_deserialize_request, profile);
   using namespace std::string_literals;
   using T = decltype(func);
   using param_type = util::function_parameters_t<T>;
@@ -106,6 +119,11 @@ inline std::pair<coro_rpc::err_code, std::string> execute(
       }
     }
 
+    deserialize_sample.finish();
+    rpc_profile::stage_sample handler_sample(
+        rpc_profile::stage::server_handler_execute, profile);
+    if constexpr (has_coro_conn_v)
+      handler_sample.exclude_inline_serialization();
     if constexpr (std::is_void_v<return_type>) {
       if constexpr (std::is_void_v<Self>) {
         if constexpr (has_coro_conn_v) {
@@ -133,23 +151,34 @@ inline std::pair<coro_rpc::err_code, std::string> execute(
                                           std::move(args)));
         }
       }
-      return std::pair{err_code{}, serialize_proto::serialize()};
+      if constexpr (has_coro_conn_v) {
+        handler_sample.finish();
+        // Preserve the framework's unused placeholder result, but only the
+        // response serialized through context belongs in the profile.
+        return std::pair{err_code{}, serialize_proto::serialize()};
+      }
+      else {
+        return std::pair{err_code{}, serialize_result<serialize_proto>(handler_sample, profile)};
+      }
     }
     else {
       if constexpr (std::is_void_v<Self>) {
         auto ret = std::apply(func, std::move(args));
         return std::pair{err_code{},
-                         serialize_proto::serialize(std::move(ret))};
+                         serialize_result<serialize_proto>(handler_sample, profile, std::move(ret))};
       }
       else {
         auto ret = std::apply(func, std::tuple_cat(std::forward_as_tuple(*self),
                                                    std::move(args)));
         return std::pair{err_code{},
-                         serialize_proto::serialize(std::move(ret))};
+                         serialize_result<serialize_proto>(handler_sample, profile, std::move(ret))};
       }
     }
   }
   else {
+    deserialize_sample.finish();
+    rpc_profile::stage_sample handler_sample(
+        rpc_profile::stage::server_handler_execute, profile);
     if constexpr (std::is_void_v<return_type>) {
       if constexpr (std::is_void_v<Self>) {
         func();
@@ -157,15 +186,16 @@ inline std::pair<coro_rpc::err_code, std::string> execute(
       else {
         (self->*func)();
       }
-      return std::pair{err_code{}, serialize_proto::serialize()};
+      return std::pair{err_code{}, serialize_result<serialize_proto>(handler_sample, profile)};
     }
     else {
       if constexpr (std::is_void_v<Self>) {
-        return std::pair{err_code{}, serialize_proto::serialize(func())};
+        return std::pair{err_code{}, serialize_result<serialize_proto>(
+                                         handler_sample, profile, func())};
       }
       else {
         return std::pair{err_code{},
-                         serialize_proto::serialize((self->*func)())};
+                         serialize_result<serialize_proto>(handler_sample, profile, (self->*func)())};
       }
     }
   }
@@ -175,6 +205,12 @@ template <typename rpc_protocol, typename serialize_proto, auto func,
           typename Self = void>
 inline async_simple::coro::Lazy<std::pair<coro_rpc::err_code, std::string>>
 execute_coro(std::string_view data, Self *self = nullptr) {
+  auto* local = co_await async_simple::coro::CurrentLazyLocals<
+      coro_connection::connection_lazy_ctx<rpc_protocol>>{};
+  auto profile_owner = local ? local->info_->profile() : nullptr;
+  auto* profile = profile_owner.get();
+  rpc_profile::stage_sample deserialize_sample(
+      rpc_profile::stage::server_deserialize_request, profile);
   using namespace std::string_literals;
   using T = decltype(func);
   using param_type = util::function_parameters_t<T>;
@@ -199,6 +235,9 @@ execute_coro(std::string_view data, Self *self = nullptr) {
         co_return std::make_pair(coro_rpc::errc::invalid_rpc_arguments,
                                  "invalid rpc function arguments"s);
       }
+    deserialize_sample.finish();
+    rpc_profile::stage_sample handler_sample(
+        rpc_profile::stage::server_handler_execute, profile);
     if constexpr (std::is_void_v<return_type>) {
       if constexpr (std::is_void_v<Self>) {
         // call void func(args...)
@@ -209,25 +248,28 @@ execute_coro(std::string_view data, Self *self = nullptr) {
         co_await std::apply(func, std::tuple_cat(std::forward_as_tuple(*self),
                                                  std::move(args)));
       }
-      co_return std::pair{err_code{}, serialize_proto::serialize()};
+      co_return std::pair{err_code{}, serialize_result<serialize_proto>(handler_sample, profile)};
     }
     else {
       if constexpr (std::is_void_v<Self>) {
         // call return_type func(args...)
         co_return std::pair{err_code{},
-                            serialize_proto::serialize(
+                            serialize_result<serialize_proto>(handler_sample, profile,
                                 co_await std::apply(func, std::move(args)))};
       }
       else {
         // call return_type self->func(args...)
         co_return std::pair{
-            err_code{}, serialize_proto::serialize(co_await std::apply(
+            err_code{}, serialize_result<serialize_proto>(handler_sample, profile, co_await std::apply(
                             func, std::tuple_cat(std::forward_as_tuple(*self),
                                                  std::move(args))))};
       }
     }
   }
   else {
+    deserialize_sample.finish();
+    rpc_profile::stage_sample handler_sample(
+        rpc_profile::stage::server_handler_execute, profile);
     if constexpr (std::is_void_v<return_type>) {
       if constexpr (std::is_void_v<Self>) {
         co_await func();
@@ -237,16 +279,18 @@ execute_coro(std::string_view data, Self *self = nullptr) {
         co_await (self->*func)();
         // clang-format on
       }
-      co_return std::pair{err_code{}, serialize_proto::serialize()};
+      co_return std::pair{err_code{}, serialize_result<serialize_proto>(handler_sample, profile)};
     }
     else {
       if constexpr (std::is_void_v<Self>) {
         co_return std::pair{err_code{},
-                            serialize_proto::serialize(co_await func())};
+                            serialize_result<serialize_proto>(
+                                handler_sample, profile, co_await func())};
       }
       else {
         // clang-format off
-          co_return std::pair{err_code{},serialize_proto::serialize(co_await (self->*func)())};
+          co_return std::pair{err_code{}, serialize_result<serialize_proto>(
+              handler_sample, profile, co_await (self->*func)())};
         // clang-format on
       }
     }

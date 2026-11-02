@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -1603,6 +1604,7 @@ class coro_rpc_client {
     async_simple::Promise<async_rpc_raw_result> promise_;
     coro_io::data_view response_attachment_buffer_;
     std::unique_ptr<rpc_trace_t> trace_;
+    std::shared_ptr<rpc_profile::request_trace> profile_;
     handler_t(std::unique_ptr<coro_io::period_timer> &&timer,
               async_simple::Promise<async_rpc_raw_result> &&promise,
               coro_io::data_view buffer = {})
@@ -1620,6 +1622,8 @@ class coro_rpc_client {
         trace_->finish(receive_end, resp_bytes,
                        rpc_errc ? "rpc_error" : "ok", rpc_errc);
       }
+      if (profile_)
+        profile_->response_ready_ns.store(rpc_profile::now_ns(), std::memory_order_release);
       promise_.setValue(async_rpc_raw_result{async_rpc_raw_result_value_type{
           std::move(buffer), response_attachment_buffer_, rpc_errc}});
     }
@@ -1635,6 +1639,8 @@ class coro_rpc_client {
                        static_cast<uint16_t>(timeout ? errc::timed_out
                                                      : errc::io_error));
       }
+      if (profile_)
+        profile_->response_ready_ns.store(rpc_profile::now_ns(), std::memory_order_release);
       promise_.setValue(async_rpc_raw_result{ec});
     }
 
@@ -1752,7 +1758,8 @@ class coro_rpc_client {
   template <auto func, typename Socket, typename... Args>
   async_simple::coro::Lazy<rpc_error> send_request_for_impl(
       Socket &soc, request_config_t &config, uint32_t &id,
-      coro_io::period_timer &timer, rpc_trace_t *trace, Args &&...args) {
+      coro_io::period_timer &timer, rpc_trace_t *trace,
+      rpc_profile::request_trace *profile, Args &&...args) {
     if (control_->has_closed_)
       AS_UNLIKELY {
         ELOG_ERROR << "client has been closed, please re-connect"
@@ -1777,7 +1784,7 @@ class coro_rpc_client {
           });
     }
     co_return co_await send_impl<func>(
-        soc, id, trace,
+        soc, id, trace, profile,
         coro_io::data_view{config.request_attachment,
                            config.request_attachment_gpu_id},
         std::forward<Args>(args)...);
@@ -1804,7 +1811,10 @@ class coro_rpc_client {
       coro_rpc_protocol::resp_header header;
       char buffer[coro_rpc_protocol::RESP_HEAD_LEN];
       auto tp = std::chrono::steady_clock::now();
+      rpc_profile::stage_sample header_sample(rpc_profile::stage::client_recv_header,
+          nullptr, 0, rpc_profile::slow_threshold_ns() != 0);
       ret = co_await coro_io::async_read(socket, asio::buffer(buffer));
+      auto header_ns = header_sample.finish();
       [[maybe_unused]] auto ec = struct_pack::deserialize_to<
           struct_pack::sp_config::DISABLE_ALL_META_INFO>(
           header, std::string_view{buffer, buffer + sizeof(buffer)});
@@ -1837,6 +1847,10 @@ class coro_rpc_client {
       ELOG_TRACE << "find request ID: " << header.seq_num
                  << ". start notify response handler"
                  << ", client_id: " << controller->client_id;
+      if (handler->profile_)
+        handler->profile_->add(rpc_profile::stage::client_recv_header, header_ns);
+      rpc_profile::stage_sample payload_sample(
+          rpc_profile::stage::client_recv_payload, handler->profile_.get(), header.length + header.attach_length);
       uint32_t body_len = header.length;
       struct_pack::detail::resize(
           controller->resp_buffer_.read_buf_,
@@ -1907,6 +1921,7 @@ class coro_rpc_client {
       }
       const auto receive_end = handler->trace_ ? rpc_trace_t::clock::now()
                                              : rpc_trace_t::clock::time_point{};
+      payload_sample.finish();
       auto cost_time = (std::chrono::steady_clock::now() - tp) /
                        std::chrono::microseconds(1);
       if (ret.first) {
@@ -1985,8 +2000,21 @@ class coro_rpc_client {
   static async_simple::coro::Lazy<async_rpc_result<T>> deserialize_rpc_result(
       async_simple::Future<async_rpc_raw_result> future,
       std::weak_ptr<control_t> watcher, recving_guard guard,
-      uint64_t client_id) {
+      uint64_t client_id, std::shared_ptr<rpc_profile::request_trace> profile) {
     auto ret_ = co_await std::move(future);
+    if (profile) {
+      auto ready = profile->response_ready_ns.load(std::memory_order_acquire);
+      if (ready) {
+        auto duration = rpc_profile::now_ns() - ready;
+        profile->add(rpc_profile::stage::client_response_resume, duration);
+        rpc_profile::record(rpc_profile::stage::client_response_resume, duration);
+      }
+    }
+    struct finish_trace {
+      rpc_profile::request_trace* trace;
+      const char* status = "error";
+      ~finish_trace() { if (trace) trace->finish(status); }
+    } finish{profile.get()};
     guard.release();
     if (ret_.index() == 1) [[unlikely]] {  // local error
       auto &ret = std::get<1>(ret_);
@@ -2003,8 +2031,12 @@ class coro_rpc_client {
 
     bool has_error = false;
     auto &ret = std::get<0>(ret_);
+    rpc_profile::stage_sample deserialize_sample(
+        rpc_profile::stage::client_deserialize_response, profile.get());
     auto result = handle_response_buffer<T>(ret.buffer_.read_buf_, ret.errc_,
                                             has_error, client_id);
+    deserialize_sample.finish();
+    finish.status = result ? "ok" : "rpc_error";
     if (has_error) {
       if (auto w = watcher.lock(); w) {
         close_socket_async(std::move(w));
@@ -2080,6 +2112,7 @@ class coro_rpc_client {
         std::move(timer), std::move(promise),
         coro_io::data_view{config.resp_attachment_buf,
                            config.resp_attachment_buf_gpu_id});
+    handler->profile_ = rpc_profile::make_trace(config_.client_id, id, get_func_name<func>());
     if (control_->trace_rpc_) {
       std::lock_guard lock(control_->trace_endpoints_mtx_);
       handler->trace_ = std::make_unique<rpc_trace_t>(
@@ -2092,6 +2125,7 @@ class coro_rpc_client {
       is_ok = control_->response_handler_table_.try_emplace(id, handler).second;
     }
     if (!is_ok) [[unlikely]] {
+      if (handler->profile_) handler->profile_->finish("serial_number_conflict");
       if (handler->trace_) {
         handler->trace_->finish(
             rpc_trace_t::clock::now(), -1, "send_error",
@@ -2103,7 +2137,7 @@ class coro_rpc_client {
     }
     auto result = co_await control_->socket_wrapper_.visit([&](auto &socket) {
       return send_request_for_impl<func>(socket, config, id, handler->timer(),
-                                         handler->trace_.get(),
+                                         handler->trace_.get(), handler->profile_.get(),
                                          std::forward<Args>(args)...);
     });
     if (result) {
@@ -2112,6 +2146,7 @@ class coro_rpc_client {
         control_->response_handler_table_.erase(id);
       }
       if (handler) {
+        if (handler->profile_) handler->profile_->finish("send_error");
         handler->timer().cancel();
         if (handler->trace_) {
           handler->trace_->finish(
@@ -2131,7 +2166,7 @@ class coro_rpc_client {
     }
     co_return deserialize_rpc_result<rpc_return_t>(
         std::move(future), std::weak_ptr<control_t>{control_}, std::move(guard),
-        config_.client_id);
+        config_.client_id, handler->profile_);
   }
 
   uint32_t get_pipeline_size() const noexcept {
@@ -2141,11 +2176,14 @@ class coro_rpc_client {
  private:
   template <auto func, typename Socket, typename... Args>
   async_simple::coro::Lazy<rpc_error> send_impl(
-      Socket &socket, uint32_t &id, rpc_trace_t *trace,
+      Socket &socket, uint32_t &id, rpc_trace_t *trace, rpc_profile::request_trace *profile,
       coro_io::data_view req_attachment,
       Args &&...args) {
+    rpc_profile::stage_sample prepare_sample(
+        rpc_profile::stage::client_prepare_request, profile);
     auto buffer = prepare_buffer<func>(id, req_attachment.size(),
                                        std::forward<Args>(args)...);
+    prepare_sample.finish();
     if (buffer.empty()) {
       co_return rpc_error{errc::message_too_large};
     }
@@ -2208,6 +2246,8 @@ class coro_rpc_client {
     }
     else {
 #endif
+      rpc_profile::stage_sample mutex_sample(
+          rpc_profile::stage::client_write_mutex_wait, profile);
       while (true) {
         bool expected = false;
         if (write_mutex_.compare_exchange_weak(expected, true)) {
@@ -2219,6 +2259,7 @@ class coro_rpc_client {
             },
             control_->executor_);
       }
+      mutex_sample.finish();
 #ifdef YLT_ENABLE_URMA
       // URMA backpressure: wait for send slots before posting new WRs.
       // Without this, consecutive async_write calls (even serialized by
@@ -2226,7 +2267,10 @@ class coro_rpc_client {
       // causing RNR retry exhaustion and WR_FLUSH_ERR.
       if constexpr (std::is_same_v<
                         Socket, coro_io::socket_wrapper_t::urma_socket_type>) {
+        rpc_profile::stage_sample slot_sample(
+            rpc_profile::stage::client_wait_send_slot, profile);
         auto slot_ec = co_await socket.waiting_write_over();
+        slot_sample.finish();
         if (slot_ec) {
           write_mutex_ = false;
           close();
@@ -2238,6 +2282,8 @@ class coro_rpc_client {
       if (trace) {
         trace->start();
       }
+      rpc_profile::stage_sample send_sample(
+          rpc_profile::stage::client_send_request, profile, buffer.size() + req_attachment.size());
       if (req_attachment.empty()) {
         ret = co_await coro_io::async_write(
             socket, asio::buffer(buffer.data(), buffer.size()));
@@ -2257,6 +2303,7 @@ class coro_rpc_client {
           ret = co_await coro_io::async_write(socket, iov);
         }
       }
+      send_sample.finish();
       write_mutex_ = false;
 #ifdef UNIT_TEST_INJECT
     }
