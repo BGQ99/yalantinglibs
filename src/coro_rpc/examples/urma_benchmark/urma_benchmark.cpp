@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -96,6 +97,11 @@ struct options_t {
   uint32_t server_threads = std::max(1u, std::thread::hardware_concurrency());
   uint32_t client_threads = std::max(1u, std::thread::hardware_concurrency());
   uint16_t queue_depth = 64;
+  std::optional<uint32_t> cq_size;
+  std::optional<uint16_t> recv_buffer_cnt;
+  std::optional<uint16_t> send_buffer_cnt;
+  std::optional<uint32_t> busy_poll_budget;
+  std::optional<uint32_t> poll_interval_us;
   uint8_t priority = 15;
   uint32_t buffer_size = 4 * 1024;
   uint64_t max_memory_usage = 256ull * 1024 * 1024;
@@ -123,15 +129,21 @@ void configure_urma_rpc_env(const options_t& opt) {
   set_process_env("MC_YLT_URMA_ENABLE", "1");
   set_process_env("MC_YLT_URMA_DEVICE", opt.device);
   set_process_env("MC_YLT_URMA_EID_INDEX", std::to_string(opt.eid_index));
-  set_process_env("MC_YLT_URMA_CQ_SIZE", std::to_string(opt.queue_depth * 2 + 8));
-  set_process_env("MC_YLT_URMA_RECV_BUFFER_CNT", std::to_string(opt.queue_depth));
-  set_process_env("MC_YLT_URMA_SEND_BUFFER_CNT", std::to_string(opt.queue_depth));
+  set_process_env("MC_YLT_URMA_CQ_SIZE", std::to_string(*opt.cq_size));
+  set_process_env("MC_YLT_URMA_RECV_BUFFER_CNT", std::to_string(*opt.recv_buffer_cnt));
+  set_process_env("MC_YLT_URMA_SEND_BUFFER_CNT", std::to_string(*opt.send_buffer_cnt));
   set_process_env("MC_YLT_URMA_BUFFER_SIZE", std::to_string(opt.buffer_size));
   set_process_env("MC_YLT_URMA_MAX_MEMORY_USAGE",
                   std::to_string(effective_pool_memory_usage(opt)));
   set_process_env("MC_YLT_URMA_TP_TYPE", "ctp");
   set_process_env("MC_YLT_URMA_PRIORITY", std::to_string(opt.priority));
   set_process_env("MC_YLT_URMA_EVENT_MODE", opt.event_mode);
+  if (opt.busy_poll_budget)
+    set_process_env("MC_YLT_URMA_BUSY_POLL_BUDGET",
+                    std::to_string(*opt.busy_poll_budget));
+  if (opt.poll_interval_us)
+    set_process_env("MC_YLT_URMA_POLL_INTERVAL",
+                    std::to_string(*opt.poll_interval_us));
 }
 
 void print_usage(const char* program) {
@@ -151,6 +163,15 @@ void print_usage(const char* program) {
       << "  --buffer-size <bytes>    URMA SEND chunk size. Default 4096 for "
          "CTP\n"
       << "  --queue-depth <n>        URMA send/recv queue depth. Default 64\n"
+      << "  --cq-size <n>           CQ entries [1, UINT32_MAX]; default "
+         "max(queue-depth*2+8, recv+send+2)\n"
+      << "  --recv-buffer-cnt <n>   Receive buffers [1, 65535]; default queue-depth\n"
+      << "  --send-buffer-cnt <n>   Send buffers [1, 65535]; default queue-depth\n"
+      << "  --busy-poll-budget <n>  Idle spin budget [0, UINT32_MAX]; default "
+         "RPC env or 16, raw 16\n"
+      << "  --poll-interval-us <n>  Idle poll interval [1, UINT32_MAX] us; default "
+         "RPC env or 5, raw 5\n"
+      << "                          Set the same resource options on both peers.\n"
       << "  --priority <n>          URMA JFS priority. Default 15; "
          "MC_YLT_URMA_PRIORITY overrides\n"
       << "  --max-memory-mib <n>     URMA buffer pool memory per process. "
@@ -212,6 +233,17 @@ uint32_t parse_u32(std::string_view value, std::string_view name) {
   if (number > std::numeric_limits<uint32_t>::max())
     throw std::invalid_argument("option exceeds uint32: " + std::string(name));
   return static_cast<uint32_t>(number);
+}
+
+uint32_t parse_resource_option(std::string_view value, std::string_view name,
+                               uint32_t maximum, bool allow_zero = false) {
+  if (value.empty() || value.find_first_not_of("0123456789") != value.npos ||
+      value.size() > 10)
+    throw std::invalid_argument("invalid numeric option: " + std::string(name));
+  auto number = parse_u32(value, name);
+  if ((!allow_zero && number == 0) || number > maximum)
+    throw std::invalid_argument("option out of range: " + std::string(name));
+  return number;
 }
 
 easylog::Severity parse_log_level(std::string_view value) {
@@ -290,6 +322,26 @@ options_t parse_options(int argc, char** argv) {
     }
     else if (key == "--queue-depth") {
       opt.queue_depth = static_cast<uint16_t>(parse_u64(require_value(), key));
+    }
+    else if (key == "--cq-size") {
+      opt.cq_size = parse_resource_option(
+          require_value(), key, std::numeric_limits<uint32_t>::max());
+    }
+    else if (key == "--recv-buffer-cnt") {
+      opt.recv_buffer_cnt = static_cast<uint16_t>(parse_resource_option(
+          require_value(), key, std::numeric_limits<uint16_t>::max()));
+    }
+    else if (key == "--send-buffer-cnt") {
+      opt.send_buffer_cnt = static_cast<uint16_t>(parse_resource_option(
+          require_value(), key, std::numeric_limits<uint16_t>::max()));
+    }
+    else if (key == "--busy-poll-budget") {
+      opt.busy_poll_budget = parse_resource_option(
+          require_value(), key, std::numeric_limits<uint32_t>::max(), true);
+    }
+    else if (key == "--poll-interval-us") {
+      opt.poll_interval_us = parse_resource_option(
+          require_value(), key, std::numeric_limits<uint32_t>::max());
     }
     else if (key == "--priority") {
       auto priority = parse_u64(require_value(), key);
@@ -422,6 +474,15 @@ options_t parse_options(int argc, char** argv) {
   opt.pipeline_depth = std::max<uint32_t>(opt.pipeline_depth, 1);
   opt.concurrency = std::max<uint32_t>(opt.concurrency, opt.connections);
   opt.queue_depth = std::max<uint16_t>(opt.queue_depth, 1);
+  opt.recv_buffer_cnt = opt.recv_buffer_cnt.value_or(opt.queue_depth);
+  opt.send_buffer_cnt = opt.send_buffer_cnt.value_or(opt.queue_depth);
+  auto minimum_cq = static_cast<uint32_t>(*opt.recv_buffer_cnt) +
+                    *opt.send_buffer_cnt + 2;
+  if (opt.cq_size && *opt.cq_size < minimum_cq)
+    throw std::invalid_argument("--cq-size must be at least recv-buffer-cnt + "
+                                "send-buffer-cnt + 2");
+  opt.cq_size = opt.cq_size.value_or(
+      std::max<uint32_t>(opt.queue_depth * 2 + 8, minimum_cq));
   opt.profile_sample_rate = std::max<uint32_t>(opt.profile_sample_rate, 1);
   if (opt.role == "server" && !host_was_set) {
     opt.host = "0.0.0.0";
@@ -445,16 +506,17 @@ uint64_t ceil_div(uint64_t value, uint64_t divisor) {
 uint64_t estimated_pool_memory_usage(const options_t& opt) {
   auto buffer_size = std::max<uint64_t>(opt.buffer_size, 1);
   auto connections = std::max<uint64_t>(opt.connections, 1);
-  auto queue_depth = std::max<uint64_t>(opt.queue_depth, 1);
+  auto recv_buffers = static_cast<uint64_t>(*opt.recv_buffer_cnt);
+  auto send_buffers = static_cast<uint64_t>(*opt.send_buffer_cnt);
   auto payload_chunks =
       ceil_div(static_cast<uint64_t>(opt.payload_size) + 1024, buffer_size);
 
   // Each connection keeps recv WRs posted and can also cache completed recv
   // buffers while the RPC layer consumes a large message. Keep enough slack for
   // send completions and protocol framing without requiring users to guess.
-  auto payload_slack = std::min<uint64_t>(payload_chunks, queue_depth);
+  auto payload_slack = std::min<uint64_t>(payload_chunks, recv_buffers);
   auto buffers_per_connection =
-      queue_depth * 2 + queue_depth + payload_slack + 16;
+      recv_buffers * 2 + send_buffers + payload_slack + 16;
   auto required_buffers =
       saturated_mul(connections, buffers_per_connection) + 1024;
   return saturated_mul(required_buffers, buffer_size);
@@ -467,15 +529,18 @@ uint64_t effective_pool_memory_usage(const options_t& opt) {
 #ifdef YLT_ENABLE_URMA
 coro_io::urma_socket_t::config_t make_urma_config(const options_t& opt) {
   return coro_io::urma_socket_t::config_t{
-      .cq_size = static_cast<uint32_t>(opt.queue_depth * 2 + 8),
-      .recv_buffer_cnt = opt.queue_depth,
-      .send_buffer_cnt = opt.queue_depth,
+      .cq_size = *opt.cq_size,
+      .recv_buffer_cnt = *opt.recv_buffer_cnt,
+      .send_buffer_cnt = *opt.send_buffer_cnt,
       .buffer_size = opt.buffer_size,
       .max_memory_usage = effective_pool_memory_usage(opt),
       .device_name = opt.device,
       .eid_index = opt.eid_index,
       .tp_type = URMA_CTP,
-      .jfs_priority = opt.priority};
+      .jfs_priority = opt.priority,
+      .event_mode = opt.event_mode == "true",
+      .busy_poll_budget = opt.busy_poll_budget.value_or(16),
+      .poll_interval = std::chrono::microseconds(opt.poll_interval_us.value_or(5))};
 }
 
 bool init_global_urma(const options_t& opt) {
